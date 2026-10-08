@@ -552,46 +552,195 @@ def get_server_id(page):
         page.screenshot(path="server_id_error.png")
         return None
 
+def find_visible(page, selectors):
+    """Return the first visible element from a list of stable-to-fallback selectors."""
+    for selector in selectors:
+        try:
+            matches = page.locator(selector)
+            for index in range(matches.count()):
+                candidate = matches.nth(index)
+                if candidate.is_visible():
+                    return candidate
+        except Exception:
+            continue
+    return None
+
+def log_page_diagnostics(page, label):
+    """Log enough UI context to diagnose a selector change without dumping page secrets."""
+    try:
+        controls = page.locator('button, a, input[type="submit"]')
+        visible = []
+        for index in range(min(controls.count(), 80)):
+            control = controls.nth(index)
+            try:
+                if not control.is_visible():
+                    continue
+                info = control.evaluate("""el => ({
+                    tag: el.tagName.toLowerCase(),
+                    text: (el.innerText || el.value || el.getAttribute('aria-label') || '').trim(),
+                    type: el.getAttribute('type') || '',
+                    onclick: el.getAttribute('onclick') || ''
+                })""")
+                text = re.sub(r'\s+', ' ', info.get('text', ''))[:80]
+                onclick = info.get('onclick', '')[:100]
+                visible.append(
+                    f"{info.get('tag')}[type={info.get('type')!r}] "
+                    f"text={text!r} onclick={onclick!r}"
+                )
+                if len(visible) >= 25:
+                    break
+            except Exception:
+                continue
+        log(f"🔍 {label}: URL={page.url}, Title={page.title()!r}")
+        log(f"🔍 {label}可见控件: {' | '.join(visible) if visible else '无'}")
+    except Exception as e:
+        log(f"⚠️ 无法记录页面诊断信息: {e}")
+
+def service_page_ready(page):
+    """Require actual service-page content, not merely a non-Cloudflare page title."""
+    try:
+        if not page_ready(page) or "auth/login" in page.url:
+            return False
+        if "/service/" not in page.url or "/manage" not in page.url:
+            return False
+        return page.locator(
+            'button[onclick*="showRenewAlert"], form[action*="/renew"], '
+            'h6:has-text("Due date"), dt:has-text("Due date")'
+        ).count() > 0
+    except Exception:
+        return False
+
+def open_service_page(page):
+    if page.url.rstrip('/') != SERVICE_URL.rstrip('/'):
+        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+    solved = solve_turnstile(
+        page, timeout=60, success_check=service_page_ready, reload_after=8,
+        shot_on_timeout="service_page_timeout.png"
+    )
+    if not solved or not service_page_ready(page):
+        log_page_diagnostics(page, "服务页未就绪")
+        try:
+            page.screenshot(path="service_page_failed.png")
+        except Exception:
+            pass
+        return False
+    return True
+
+DATE_PATTERNS = (
+    r"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}",
+    r"[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}",
+    r"\d{4}[-/]\d{1,2}[-/]\d{1,2}",
+)
+
+def extract_due_date(text):
+    for pattern in DATE_PATTERNS:
+        match = re.search(pattern, text or "", re.IGNORECASE)
+        if match:
+            return match.group(0).strip()
+    return None
+
 def get_due_date(page):
     try:
-        if SERVICE_URL not in page.url:
-            page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-        solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+        if not open_service_page(page):
+            return "未知"
+
+        # Current HidenCloud markup renders the value next to a "Due date" heading.
+        # Read that structure first, then fall back to scanning the full page text.
+        value_selectors = (
+            'h6:has-text("Due date") + div',
+            'dt:has-text("Due date") + dd',
+            '[data-label="Due date"]',
+        )
+        for selector in value_selectors:
+            try:
+                values = page.locator(selector)
+                for index in range(values.count()):
+                    due_date = extract_due_date(values.nth(index).inner_text())
+                    if due_date:
+                        log(f"📅 获取到 Due Date: {due_date}")
+                        return due_date
+            except Exception:
+                continue
+
         body_text = page.locator("body").inner_text()
-        patterns = [
-            r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
-            r"Due date\s*\n\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
-            r"Due date.*?(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, body_text, re.IGNORECASE | re.DOTALL)
+        for date_pattern in DATE_PATTERNS:
+            match = re.search(
+                rf"Due\s*date\s*:?\s*(?:\r?\n\s*)?({date_pattern})",
+                body_text, re.IGNORECASE
+            )
             if match:
                 due_date = match.group(1).strip()
-                log(f"📅 获取到Due Date: {due_date}")
+                log(f"📅 获取到 Due Date: {due_date}")
                 return due_date
+        log("⚠️ 服务页中未识别到 Due Date")
+        log_page_diagnostics(page, "到期时间识别失败")
+        page.screenshot(path="due_date_unknown.png")
     except Exception as e:
-        log(f"❌ 获取Due Date失败: {e}")
+        log(f"❌ 获取 Due Date 失败: {e}")
     return "未知"
 
 def renew_service(page):
 
     try:
         log("➡ 进入续期流程...")
-        if page.url != SERVICE_URL:
-            page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-        solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+        if not open_service_page(page):
+            return False
 
         log("🖱️ 准备点击 'Renew' 按钮...")
-        renew_btn = page.locator('button:has-text("Renew")')
-        create_btn = page.locator('button:has-text("Create Invoice")')
+        renew_selectors = (
+            'button[onclick*="showRenewAlert"]',
+            'form[action*="/renew"] button[type="submit"]',
+            'button:has(i.bx-recycle)',
+            'button:has-text("Renew")',
+            'a:has-text("Renew")',
+            'button:has-text("续期")',
+            'a:has-text("续期")',
+        )
+        create_selectors = (
+            'div[id^="renewService-"] button[type="submit"]',
+            'form[action*="/renew"] button[type="submit"]',
+            'button:has-text("Create Invoice")',
+            'button:has-text("创建发票")',
+        )
+
+        renew_btn = None
+        deadline = time.time() + 20
+        while time.time() < deadline and renew_btn is None:
+            renew_btn = find_visible(page, renew_selectors)
+            if renew_btn is None:
+                time.sleep(1)
+
+        if renew_btn is None:
+            log("❌ 服务页上未找到 Renew 按钮。")
+            log_page_diagnostics(page, "Renew 按钮缺失")
+            page.screenshot(path="renew_button_not_found.png")
+            return False
+
+        onclick = renew_btn.get_attribute("onclick") or ""
+        button_text = re.sub(r'\s+', ' ', renew_btn.inner_text()).strip()
+        log(f"✅ 找到 Renew 控件: text={button_text!r}, onclick={onclick!r}")
+
+        eligibility = re.search(
+            r"showRenewAlert\(\s*(-?\d+)\s*,\s*(\d+)\s*,\s*(true|false)\s*\)",
+            onclick, re.IGNORECASE
+        )
+        if eligibility:
+            days_left = int(eligibility.group(1))
+            threshold = int(eligibility.group(2))
+            log(f"📆 当前剩余 {days_left} 天，允许续期阈值为 {threshold} 天")
+            if days_left > threshold:
+                log("⚠️ 未到续期时间，无需打开限制弹窗。")
+                return "NOT_TIME"
 
         modal_opened = False
-        for i in range(6):
+        for i in range(3):
             try:
-                renew_btn.wait_for(state="visible", timeout=10000)
+                renew_btn = find_visible(page, renew_selectors)
+                if renew_btn is None:
+                    raise RuntimeError("Renew 控件在点击前消失")
                 renew_btn.scroll_into_view_if_needed()
                 log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
-                renew_btn.click()
+                renew_btn.click(timeout=10000)
 
                 # 等待一小段时间，检测是否出现“未到续期时间”弹窗
                 time.sleep(2)
@@ -602,17 +751,21 @@ def renew_service(page):
                     return "NOT_TIME"   # 特殊状态
 
                 log("🖲️ 等待弹窗出现...")
-                try:
-                    create_btn.wait_for(state="visible", timeout=5000)
-                    modal_opened = True
-                    log("✅ 弹窗已成功弹出！")
-                    break
-                except:
+                modal_deadline = time.time() + 10
+                while time.time() < modal_deadline:
+                    if find_visible(page, create_selectors) is not None:
+                        modal_opened = True
+                        log("✅ 弹窗已成功弹出！")
+                        break
                     # 弹窗可能先展示 Turnstile，创建按钮稍后才出现
                     if challenge_boxes(page):
                         modal_opened = True
                         log("✅ 弹窗已弹出（先出现 Turnstile 验证）！")
                         break
+                    time.sleep(0.5)
+                if modal_opened:
+                    break
+                else:
                     log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
                     time.sleep(2)
             except Exception as e:
@@ -630,14 +783,19 @@ def renew_service(page):
             log("⚠️ 弹窗内 Turnstile 未确认通过，仍尝试点击 'Create Invoice'...")
 
         # 等待 Create Invoice 按钮就绪并点击
-        try:
-            create_btn.wait_for(state="visible", timeout=30000)
-        except Exception:
-            pass
+        create_btn = None
+        deadline = time.time() + 30
+        while time.time() < deadline and create_btn is None:
+            create_btn = find_visible(page, create_selectors)
+            if create_btn is None:
+                time.sleep(1)
 
         create_clicked = False
         for i in range(3):
             try:
+                create_btn = find_visible(page, create_selectors)
+                if create_btn is None:
+                    raise RuntimeError("Create Invoice 控件不可见")
                 log(f"🖱️ 点击 'Create Invoice'（第 {i+1} 次）...")
                 create_btn.click(timeout=8000)
                 create_clicked = True
@@ -654,11 +812,17 @@ def renew_service(page):
         new_invoice_url = None
         start_wait = time.time()
         while time.time() - start_wait < 90:
-            if "/payment/invoice/" in page.url:
+            if "/invoice/" in page.url:
                 new_invoice_url = page.url
                 log(f"🎉 页面已跳转: {new_invoice_url}")
                 break
-            if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
+            invoice_link = find_visible(page, ('a[href*="/invoice/"]',))
+            if invoice_link is not None:
+                log("🔗 页面已生成发票链接，正在打开...")
+                invoice_link.click(timeout=10000)
+                time.sleep(2)
+                continue
+            if challenge_boxes(page):
                 log("⚠️ 遇到拦截，尝试处理...")
                 solve_turnstile(page, timeout=45, reload_after=8)
             time.sleep(1)
@@ -673,8 +837,25 @@ def renew_service(page):
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
 
         log("🔎 查找 'Pay' 按钮...")
-        pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
-        pay_btn.wait_for(state="visible", timeout=30000)
+        pay_selectors = (
+            'form[action*="/invoice/"] button[type="submit"]',
+            'form[action*="/payment/"] button[type="submit"]',
+            'button:has-text("Pay the Free Invoice")',
+            'button:has-text("Pay")',
+            'a:has-text("Pay")',
+            'button:has-text("支付")',
+        )
+        pay_btn = None
+        deadline = time.time() + 30
+        while time.time() < deadline and pay_btn is None:
+            pay_btn = find_visible(page, pay_selectors)
+            if pay_btn is None:
+                time.sleep(1)
+        if pay_btn is None:
+            log("❌ 发票页上未找到支付按钮。")
+            log_page_diagnostics(page, "Pay 按钮缺失")
+            page.screenshot(path="pay_button_not_found.png")
+            return False
         pay_btn.click()
         log("✅ 'Pay' 按钮已点击。")
 
@@ -682,7 +863,8 @@ def renew_service(page):
         time.sleep(5)
         # 返回服务管理页面以获取新的到期时间
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-        solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+        if not open_service_page(page):
+            return False
         return True
 
     except Exception as e:
