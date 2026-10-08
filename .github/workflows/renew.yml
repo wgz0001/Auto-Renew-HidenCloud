@@ -1,3 +1,4 @@
+
 name: Auto Renew HidenCloud
 
 on:
@@ -48,7 +49,18 @@ jobs:
           COOKIE_VALUE: ${{ secrets.COOKIE_VALUE }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
+        run: |
+          set -o pipefail
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py 2>&1 | tee renew.log
+
+      - name: 📎 上传失败日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renew-failure-log-${{ github.run_number }}
+          path: renew.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       # 更新时间到time.txt,避免6个月未更新导致工作流暂停
       - name: 🕒 更新时间
