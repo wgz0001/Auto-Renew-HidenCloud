@@ -58,7 +58,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: renew-failure-log-${{ github.run_number }}
-          path: renew.log
+          path: |
+            renew.log
+            *.png
           if-no-files-found: ignore
           retention-days: 7
 
