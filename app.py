@@ -565,6 +565,77 @@ def find_visible(page, selectors):
             continue
     return None
 
+def control_details(control):
+    """Return non-secret attributes that help explain why a control did not react."""
+    try:
+        return control.evaluate("""el => {
+            const form = el.closest('form');
+            const attrNames = [
+                'onclick', 'wire:click', 'x-on:click', '@click',
+                'data-bs-toggle', 'data-bs-target', 'data-modal-target',
+                'formaction'
+            ];
+            const attrs = {};
+            for (const name of attrNames) {
+                const value = el.getAttribute(name);
+                if (value !== null) attrs[name] = value;
+            }
+            return {
+                tag: el.tagName.toLowerCase(),
+                id: el.id || '',
+                type: el.getAttribute('type') || '',
+                classes: el.className || '',
+                disabled: !!el.disabled,
+                ariaDisabled: el.getAttribute('aria-disabled') || '',
+                formAction: form ? (form.getAttribute('action') || '') : '',
+                attrs: attrs
+            };
+        }""")
+    except Exception as e:
+        return {"error": str(e)}
+
+def click_control(page, control, attempt):
+    """Use a different browser-level click path on each retry."""
+    if attempt == 0:
+        control.click(timeout=10000)
+        return "Playwright click"
+    if attempt == 1:
+        control.evaluate("el => el.click()")
+        return "DOM click"
+
+    box = control.bounding_box()
+    if not box:
+        raise RuntimeError("Renew 控件没有可点击区域")
+    x = box['x'] + box['width'] / 2
+    y = box['y'] + box['height'] / 2
+    if not cdp_click_at(page, x, y):
+        raise RuntimeError("坐标点击失败")
+    return "browser coordinate click"
+
+def renew_page_state(page, create_selectors, dialog_selectors):
+    """Classify the observable result of clicking Renew."""
+    try:
+        if "/invoice/" in page.url:
+            return "INVOICE"
+    except Exception:
+        pass
+
+    try:
+        body_text = page.locator("body").inner_text(timeout=3000)
+        lower_text = body_text.lower()
+        if "Renewal Restricted" in body_text or "can only renew" in lower_text:
+            return "NOT_TIME"
+    except Exception:
+        pass
+
+    if find_visible(page, create_selectors) is not None:
+        return "MODAL"
+    if challenge_boxes(page):
+        return "MODAL"
+    if find_visible(page, dialog_selectors) is not None:
+        return "MODAL"
+    return None
+
 def log_page_diagnostics(page, label):
     """Log enough UI context to diagnose a selector change without dumping page secrets."""
     try:
@@ -579,13 +650,19 @@ def log_page_diagnostics(page, label):
                     tag: el.tagName.toLowerCase(),
                     text: (el.innerText || el.value || el.getAttribute('aria-label') || '').trim(),
                     type: el.getAttribute('type') || '',
-                    onclick: el.getAttribute('onclick') || ''
+                    onclick: el.getAttribute('onclick') || '',
+                    id: el.id || '',
+                    disabled: !!el.disabled,
+                    ariaDisabled: el.getAttribute('aria-disabled') || '',
+                    formAction: el.form ? (el.form.getAttribute('action') || '') : ''
                 })""")
                 text = re.sub(r'\s+', ' ', info.get('text', ''))[:80]
                 onclick = info.get('onclick', '')[:100]
                 visible.append(
-                    f"{info.get('tag')}[type={info.get('type')!r}] "
-                    f"text={text!r} onclick={onclick!r}"
+                    f"{info.get('tag')}#{info.get('id', '')}[type={info.get('type')!r}] "
+                    f"text={text!r} disabled={info.get('disabled')} "
+                    f"aria-disabled={info.get('ariaDisabled')!r} "
+                    f"form={info.get('formAction')!r} onclick={onclick!r}"
                 )
                 if len(visible) >= 25:
                     break
@@ -698,9 +775,18 @@ def renew_service(page):
         )
         create_selectors = (
             'div[id^="renewService-"] button[type="submit"]',
-            'form[action*="/renew"] button[type="submit"]',
+            '[role="dialog"] form[action*="/renew"] button[type="submit"]',
+            '.modal.show form[action*="/renew"] button[type="submit"]',
+            '.fixed.inset-0 form[action*="/renew"] button[type="submit"]',
             'button:has-text("Create Invoice")',
             'button:has-text("创建发票")',
+        )
+        dialog_selectors = (
+            'div[id^="renewService-"]:visible',
+            '[role="dialog"]:has-text("Create Invoice"):visible',
+            'dialog[open]:has-text("Create Invoice")',
+            '.modal.show:has-text("Create Invoice")',
+            '.fixed.inset-0:has-text("Create Invoice"):visible',
         )
 
         renew_btn = None
@@ -719,6 +805,7 @@ def renew_service(page):
         onclick = renew_btn.get_attribute("onclick") or ""
         button_text = re.sub(r'\s+', ' ', renew_btn.inner_text()).strip()
         log(f"✅ 找到 Renew 控件: text={button_text!r}, onclick={onclick!r}")
+        log(f"🔍 Renew 控件属性: {control_details(renew_btn)}")
 
         eligibility = re.search(
             r"showRenewAlert\(\s*(-?\d+)\s*,\s*(\d+)\s*,\s*(true|false)\s*\)",
@@ -733,6 +820,7 @@ def renew_service(page):
                 return "NOT_TIME"
 
         modal_opened = False
+        new_invoice_url = None
         for i in range(3):
             try:
                 renew_btn = find_visible(page, renew_selectors)
@@ -740,92 +828,91 @@ def renew_service(page):
                     raise RuntimeError("Renew 控件在点击前消失")
                 renew_btn.scroll_into_view_if_needed()
                 log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
-                renew_btn.click(timeout=10000)
+                click_method = click_control(page, renew_btn, i)
+                log(f"✅ 已执行 {click_method}，当前 URL: {page.url}")
 
-                # 等待一小段时间，检测是否出现“未到续期时间”弹窗
-                time.sleep(2)
-                page_text = page.locator("body").inner_text()
-                if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
-                    log("⚠️ 未到续期时间，无法续期。")
-                    page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME"   # 特殊状态
-
-                log("🖲️ 等待弹窗出现...")
+                log("🖲️ 等待续期弹窗或账单页面...")
                 modal_deadline = time.time() + 10
                 while time.time() < modal_deadline:
-                    if find_visible(page, create_selectors) is not None:
-                        modal_opened = True
-                        log("✅ 弹窗已成功弹出！")
+                    state = renew_page_state(page, create_selectors, dialog_selectors)
+                    if state == "NOT_TIME":
+                        log("⚠️ 未到续期时间，无法续期。")
+                        page.screenshot(path="renew_not_allowed.png")
+                        return "NOT_TIME"
+                    if state == "INVOICE":
+                        new_invoice_url = page.url
+                        log(f"🎉 Renew 已直接进入账单页: {new_invoice_url}")
                         break
-                    # 弹窗可能先展示 Turnstile，创建按钮稍后才出现
-                    if challenge_boxes(page):
+                    if state == "MODAL":
                         modal_opened = True
-                        log("✅ 弹窗已弹出（先出现 Turnstile 验证）！")
+                        log("✅ 已检测到续期弹窗或续期验证控件！")
                         break
                     time.sleep(0.5)
-                if modal_opened:
+                if modal_opened or new_invoice_url:
                     break
                 else:
-                    log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
+                    log(f"⚠️ 点击后未出现下一步，当前 URL: {page.url}，准备更换点击方式...")
                     time.sleep(2)
             except Exception as e:
                 log(f"❌ 点击尝试出错: {e}")
 
-        if not modal_opened:
-            log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
+        if not modal_opened and not new_invoice_url:
+            log("❌ 错误：尝试多种点击方式后，续期页面仍无响应。")
+            log_page_diagnostics(page, "Renew 点击无响应")
             page.screenshot(path="renew_modal_failed.png")
             return False
 
-        # --- 弹窗内的 Turnstile：处理完再点 Create Invoice ---
-        log("🛡️ 处理弹窗内的 Turnstile...")
-        if not solve_turnstile(page, timeout=90, require_positive=True,
-                               shot_on_timeout="modal_turnstile_fail.png"):
-            log("⚠️ 弹窗内 Turnstile 未确认通过，仍尝试点击 'Create Invoice'...")
+        if modal_opened:
+            # --- 弹窗内的 Turnstile：处理完再点 Create Invoice ---
+            log("🛡️ 处理弹窗内的 Turnstile...")
+            if not solve_turnstile(page, timeout=90, require_positive=True,
+                                   shot_on_timeout="modal_turnstile_fail.png"):
+                log("⚠️ 弹窗内 Turnstile 未确认通过，仍尝试点击 'Create Invoice'...")
 
-        # 等待 Create Invoice 按钮就绪并点击
-        create_btn = None
-        deadline = time.time() + 30
-        while time.time() < deadline and create_btn is None:
-            create_btn = find_visible(page, create_selectors)
-            if create_btn is None:
-                time.sleep(1)
-
-        create_clicked = False
-        for i in range(3):
-            try:
+            # 等待 Create Invoice 按钮就绪并点击
+            create_btn = None
+            deadline = time.time() + 30
+            while time.time() < deadline and create_btn is None:
                 create_btn = find_visible(page, create_selectors)
                 if create_btn is None:
-                    raise RuntimeError("Create Invoice 控件不可见")
-                log(f"🖱️ 点击 'Create Invoice'（第 {i+1} 次）...")
-                create_btn.click(timeout=8000)
-                create_clicked = True
-                break
-            except Exception as e:
-                log(f"⚠️ 点击 'Create Invoice' 失败: {e}")
-                # 可能 token 还没生效，再处理一次 Turnstile
-                solve_turnstile(page, timeout=30, require_positive=True)
-        if not create_clicked:
-            log("❌ 无法点击 'Create Invoice'。")
-            page.screenshot(path="create_invoice_failed.png")
-            return False
+                    time.sleep(1)
 
-        new_invoice_url = None
-        start_wait = time.time()
-        while time.time() - start_wait < 90:
-            if "/invoice/" in page.url:
-                new_invoice_url = page.url
-                log(f"🎉 页面已跳转: {new_invoice_url}")
-                break
-            invoice_link = find_visible(page, ('a[href*="/invoice/"]',))
-            if invoice_link is not None:
-                log("🔗 页面已生成发票链接，正在打开...")
-                invoice_link.click(timeout=10000)
-                time.sleep(2)
-                continue
-            if challenge_boxes(page):
-                log("⚠️ 遇到拦截，尝试处理...")
-                solve_turnstile(page, timeout=45, reload_after=8)
-            time.sleep(1)
+            create_clicked = False
+            for i in range(3):
+                try:
+                    create_btn = find_visible(page, create_selectors)
+                    if create_btn is None:
+                        raise RuntimeError("Create Invoice 控件不可见")
+                    log(f"🖱️ 点击 'Create Invoice'（第 {i+1} 次）...")
+                    create_btn.click(timeout=8000)
+                    create_clicked = True
+                    break
+                except Exception as e:
+                    log(f"⚠️ 点击 'Create Invoice' 失败: {e}")
+                    # 可能 token 还没生效，再处理一次 Turnstile
+                    solve_turnstile(page, timeout=30, require_positive=True)
+            if not create_clicked:
+                log("❌ 无法点击 'Create Invoice'。")
+                log_page_diagnostics(page, "Create Invoice 控件缺失")
+                page.screenshot(path="create_invoice_failed.png")
+                return False
+
+            start_wait = time.time()
+            while time.time() - start_wait < 90:
+                if "/invoice/" in page.url:
+                    new_invoice_url = page.url
+                    log(f"🎉 页面已跳转: {new_invoice_url}")
+                    break
+                invoice_link = find_visible(page, ('a[href*="/invoice/"]',))
+                if invoice_link is not None:
+                    log("🔗 页面已生成发票链接，正在打开...")
+                    invoice_link.click(timeout=10000)
+                    time.sleep(2)
+                    continue
+                if challenge_boxes(page):
+                    log("⚠️ 遇到拦截，尝试处理...")
+                    solve_turnstile(page, timeout=45, reload_after=8)
+                time.sleep(1)
 
         if not new_invoice_url:
             log("❌ 未能进入发票页面，超时。")
@@ -955,3 +1042,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
